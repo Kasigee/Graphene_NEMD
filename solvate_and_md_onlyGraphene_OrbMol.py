@@ -312,6 +312,21 @@ def load_solvent_geom(solvent: str, path: Path | None) -> Atoms:
     raise RuntimeError(f"Could not build solvent '{solvent}': {last}")
 
 
+def load_solvent_template(solvent: str, solvent_source: str | None, solvent_lib: Path | None) -> Atoms:
+    path = None
+    if solvent_source:
+        p = Path(solvent_source)
+        if p.is_file():
+            path = p
+    if path is None and solvent_lib is not None:
+        for ext in (".xyz", ".mol", ".sdf", ".pdb", ".mol2"):
+            p = solvent_lib / f"{solvent}{ext}"
+            if p.is_file():
+                path = p
+                break
+    return load_solvent_geom(solvent, path)
+
+
 # --------------------------- graphene builder --------------------------------
 
 def build_graphene_bilayer(nx: int, ny: int, gap_A: float,
@@ -689,6 +704,421 @@ def _ensure_steps_header(steps_csv: Path):
             fh.write("step,t_ps,E_eV,T_K,fmax\n")
 
 
+# ------------------------------ NEMD helpers --------------------------------
+
+AMU_KG = 1.66053906660e-27
+ANG_M = 1.0e-10
+FS_S = 1.0e-15
+EV_J = 1.602176634e-19
+
+# Conversion: (amu*(Å/fs)^2) -> eV
+C_Ev_per_amuA2fs2 = (AMU_KG * (ANG_M / FS_S) ** 2) / EV_J  # ~103.6427
+
+
+def mps2_to_Afs2(a_mps2: float) -> float:
+    return float(a_mps2) * 1.0e-20
+
+
+def _ensure_header(path: Path, header_line: str):
+    if not path.exists():
+        with open(path, "w") as fh:
+            fh.write(header_line.rstrip() + "\n")
+
+
+def _infer_graphene_mask_from_tags(atoms: Atoms):
+    tags = atoms.get_tags()
+    if tags is None or len(tags) != len(atoms):
+        raise RuntimeError("No per-atom tags found; cannot identify graphene reliably for NEMD.")
+    gmask = (tags == 1)
+    if not np.any(gmask):
+        raise RuntimeError("No tag==1 atoms found; cannot identify graphene reliably for NEMD.")
+    return gmask
+
+
+def _sheet_z_planes_from_mask(atoms: Atoms, graphene_mask: np.ndarray):
+    z = atoms.get_positions()[:, 2]
+    zG = z[graphene_mask]
+    z_mid = float(np.median(zG))
+    bot = zG[zG <= z_mid]
+    top = zG[zG > z_mid]
+    if bot.size < 5 or top.size < 5:
+        labels, centers = kmeans1d(zG, k=2)
+        z_bot = float(zG[labels == int(np.argmin(centers))].mean())
+        z_top = float(zG[labels == int(np.argmax(centers))].mean())
+    else:
+        z_bot = float(bot.mean())
+        z_top = float(top.mean())
+    return z_bot, z_top, float(z_top - z_bot), 0.5 * (z_bot + z_top)
+
+
+def _area_xy_from_cell(cell: np.ndarray) -> float:
+    a1 = cell[0]
+    a2 = cell[1]
+    return float(np.linalg.norm(np.cross(a1, a2)))
+
+
+def _prepare_solvent_blocks(atoms: Atoms, nat_per_mol: int):
+    """
+    Assumes solvent atoms are tag!=1 and were appended as contiguous blocks of a single template.
+    Returns (solv_start, solv_end_inclusive, n_mols, nat_per_mol, masses_reshaped, weights, msum)
+    """
+    tags = atoms.get_tags()
+    solv_idx = np.where(tags != 1)[0]
+    if solv_idx.size == 0:
+        raise RuntimeError("No solvent atoms found (tag!=1).")
+    sidx = np.sort(solv_idx)
+
+    if not np.all(np.diff(sidx) == 1):
+        raise RuntimeError("Solvent indices not contiguous; molecule blocking would need a slower fallback.")
+    solv_start = int(sidx[0])
+    solv_end = int(sidx[-1])
+    n_sol_atoms = solv_end - solv_start + 1
+    if n_sol_atoms % nat_per_mol != 0:
+        raise RuntimeError(f"Solvent atoms ({n_sol_atoms}) not divisible by nat_per_mol ({nat_per_mol}).")
+
+    n_mols = n_sol_atoms // nat_per_mol
+    masses = atoms.get_masses()[solv_start:solv_end + 1].reshape(n_mols, nat_per_mol)
+    msum = masses.sum(axis=1)
+    weights = masses / msum[:, None]
+    return solv_start, solv_end, n_mols, nat_per_mol, masses, weights, msum
+
+
+def _com_from_block(pos_block: np.ndarray, weights: np.ndarray):
+    return (pos_block * weights[:, :, None]).sum(axis=1)
+
+
+def _compute_T_yz_K(v: np.ndarray, masses_amu: np.ndarray, mobile_mask: np.ndarray) -> float:
+    idx = np.where(mobile_mask)[0]
+    if idx.size == 0:
+        return float("nan")
+    m = masses_amu[idx]
+    vy = v[idx, 1]
+    vz = v[idx, 2]
+    KE_eV = 0.5 * np.sum(m * (vy * vy + vz * vz)) * C_Ev_per_amuA2fs2
+    Ndof = 2 * idx.size
+    return float((2.0 * KE_eV) / (Ndof * units.kB))
+
+
+def run_nemd_poiseuille(
+    out_dir: Path,
+    atoms: Atoms,
+    tag_name: str,
+    solvent_name: str,
+    solvent_source: str | None,
+    solvent_lib: Path | None,
+    device: str,
+    model_key: str,
+    compile_flag: bool,
+    temp_K: float,
+    dt_fs: float,
+    warmup_ps: float,
+    prod_ps: float,
+    friction_ps_inv: float,
+    body_accel_mps2: float,
+    profile_every: int,
+    profile_z_bins: int,
+    n_profile_blocks: int,
+    z_exclude_A: float,
+    traj_every: int,
+    restart_every: int,
+    resumed: bool,
+    freeze_graphene: bool,
+    seed: int,
+):
+    out_dir.mkdir(exist_ok=True, parents=True)
+    traj_path = out_dir / "traj.extxyz"
+    steps_csv = out_dir / "nemd_steps.csv"
+    wall_csv = out_dir / "wall_force.csv"
+    accum_npz = out_dir / "profile_accum.npz"
+    restart_path = out_dir / "restart_last.extxyz"
+    summary_js = out_dir / "nemd_summary.json"
+
+    _ensure_header(steps_csv, "step,t_ps,E_pot_eV,T_yz_K,fmax_eV_per_A,mean_vx_A_per_fs")
+    _ensure_header(wall_csv, "step,t_ps,Fwall_x_eV_per_A,Fwall_y_eV_per_A")
+
+    rng = np.random.default_rng(int(seed))
+
+    graphene_mask = _infer_graphene_mask_from_tags(atoms)
+    mobile_mask = ~graphene_mask if freeze_graphene else np.ones(len(atoms), dtype=bool)
+
+    setup_orb_env_for_atoms(atoms)
+    calc = get_orbcalc(model_key, device=device, compile_flag=compile_flag)
+    atoms.calc = calc
+
+    v = atoms.get_velocities()
+    if v is None:
+        MaxwellBoltzmannDistribution(atoms, temperature_K=temp_K, force_temp=True)
+        v = atoms.get_velocities()
+    v = np.array(v, float)
+
+    if freeze_graphene:
+        v[graphene_mask, :] = 0.0
+        atoms.set_velocities(v)
+
+    cell = atoms.cell.array.copy()
+    Axy = _area_xy_from_cell(cell)
+    z_bot, z_top, gap, z_mid = _sheet_z_planes_from_mask(atoms, graphene_mask)
+    if z_top <= z_bot:
+        raise RuntimeError("Bad graphene plane ordering for NEMD.")
+    z_min = float(z_bot)
+    z_max = float(z_top)
+    dz = (z_max - z_min) / int(profile_z_bins)
+    bin_edges = np.linspace(z_min, z_max, int(profile_z_bins) + 1)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    templ = load_solvent_template(solvent_name, solvent_source, solvent_lib)
+    nat_per_mol = int(len(templ))
+
+    solv_start, solv_end, n_mols, nat, masses_mol_atoms, weights, msum = _prepare_solvent_blocks(atoms, nat_per_mol)
+    mol_mass_amu = float(np.sum(templ.get_masses()))
+    mol_mass_g = mol_mass_amu * 1.66053906660e-24
+
+    a_Afs2 = mps2_to_Afs2(body_accel_mps2)
+    gamma_fs = float(friction_ps_inv) / 1000.0
+    c = float(np.exp(-gamma_fs * dt_fs))
+    masses_amu = atoms.get_masses()
+    sigma = np.sqrt((1.0 - c * c) * (units.kB * temp_K) / (masses_amu * C_Ev_per_amuA2fs2))
+
+    if accum_npz.is_file():
+        Z = np.load(accum_npz)
+        vx_sum_blk = Z["vx_sum_blk"]
+        vx_n_blk = Z["vx_n_blk"]
+        mol_n_blk = Z["mol_n_blk"]
+        mol_m_blk = Z["mol_m_blk"]
+        prod_samples_done = int(Z["prod_samples_done"])
+        assert vx_sum_blk.shape == (n_profile_blocks, profile_z_bins)
+    else:
+        vx_sum_blk = np.zeros((n_profile_blocks, profile_z_bins), dtype=float)
+        vx_n_blk = np.zeros((n_profile_blocks, profile_z_bins), dtype=float)
+        mol_n_blk = np.zeros((n_profile_blocks, profile_z_bins), dtype=float)
+        mol_m_blk = np.zeros((n_profile_blocks, profile_z_bins), dtype=float)
+        prod_samples_done = 0
+
+    last_step_logged = _read_last_logged_step(steps_csv)
+    step0 = int(last_step_logged)
+
+    n_warm_steps = int(round((warmup_ps * 1000.0) / dt_fs))
+    n_prod_steps = int(round((prod_ps * 1000.0) / dt_fs))
+    if n_prod_steps <= 0:
+        raise RuntimeError("prod_ps must be > 0 for NEMD.")
+    if profile_every < 1:
+        profile_every = 1
+
+    total_prod_samples_target = max(1, n_prod_steps // profile_every)
+    samples_per_block = max(1, int(math.floor(total_prod_samples_target / n_profile_blocks)))
+
+    def current_block_index(sample_idx: int) -> int:
+        bi = sample_idx // samples_per_block
+        return int(min(bi, n_profile_blocks - 1))
+
+    F = atoms.get_forces()
+
+    def log_step(step_abs: int, t_ps: float, v_now: np.ndarray, F_now: np.ndarray):
+        E = float(atoms.get_potential_energy())
+        fmax = float(np.linalg.norm(F_now, axis=1).max())
+        T_yz = _compute_T_yz_K(v_now, masses_amu, mobile_mask & (~graphene_mask))
+        mean_vx = float(np.mean(v_now[~graphene_mask, 0]))
+        with open(steps_csv, "a") as fh:
+            fh.write(f"{step_abs},{t_ps:.6f},{E:.8f},{T_yz:.2f},{fmax:.6f},{mean_vx:.8e}\n")
+
+    def log_wall_force(step_abs: int, t_ps: float, F_now: np.ndarray):
+        Fx = float(F_now[graphene_mask, 0].sum())
+        Fy = float(F_now[graphene_mask, 1].sum())
+        with open(wall_csv, "a") as fh:
+            fh.write(f"{step_abs},{t_ps:.6f},{Fx:.8e},{Fy:.8e}\n")
+
+    def maybe_write_traj(step_abs: int):
+        if traj_every > 0 and (step_abs % traj_every == 0):
+            atoms.set_velocities(v)
+            atoms.info["energy"] = float(atoms.get_potential_energy())
+            atoms.info["free_energy"] = float(atoms.get_potential_energy())
+            write(traj_path.as_posix(), atoms, format="extxyz", append=True)
+
+    print(f"[NEMD] {tag_name}: warmup {warmup_ps} ps, production {prod_ps} ps, a={body_accel_mps2:.3e} m/s^2")
+    t0 = time.perf_counter()
+
+    solv_atom_slice = slice(solv_start, solv_end + 1)
+    solv_atom_mask = np.zeros(len(atoms), dtype=bool)
+    solv_atom_mask[solv_start:solv_end + 1] = True
+    log_every = max(1, profile_every)
+
+    step_abs = step0
+    for istep in range(n_warm_steps + n_prod_steps):
+        acc = F / (masses_amu[:, None] * C_Ev_per_amuA2fs2)
+        acc[~graphene_mask, 0] += a_Afs2
+        if freeze_graphene:
+            acc[graphene_mask, :] = 0.0
+
+        v[mobile_mask, :] += 0.5 * dt_fs * acc[mobile_mask, :]
+
+        pos = atoms.get_positions()
+        pos[mobile_mask, :] += 0.5 * dt_fs * v[mobile_mask, :]
+        atoms.set_positions(pos)
+        atoms.wrap()
+
+        if friction_ps_inv > 0.0:
+            noise = rng.normal(size=(len(atoms), 2))
+            msk = solv_atom_mask & mobile_mask
+            v[msk, 1] = c * v[msk, 1] + sigma[msk] * noise[msk, 0]
+            v[msk, 2] = c * v[msk, 2] + sigma[msk] * noise[msk, 1]
+
+            vy_mean = float(np.mean(v[msk, 1]))
+            vz_mean = float(np.mean(v[msk, 2]))
+            v[msk, 1] -= vy_mean
+            v[msk, 2] -= vz_mean
+
+        pos = atoms.get_positions()
+        pos[mobile_mask, :] += 0.5 * dt_fs * v[mobile_mask, :]
+        atoms.set_positions(pos)
+        atoms.wrap()
+
+        atoms.set_velocities(v)
+        F = atoms.get_forces()
+
+        acc = F / (masses_amu[:, None] * C_Ev_per_amuA2fs2)
+        acc[~graphene_mask, 0] += a_Afs2
+        if freeze_graphene:
+            acc[graphene_mask, :] = 0.0
+        v[mobile_mask, :] += 0.5 * dt_fs * acc[mobile_mask, :]
+
+        if freeze_graphene:
+            v[graphene_mask, :] = 0.0
+
+        step_abs += 1
+        t_ps = step_abs * dt_fs / 1000.0
+
+        if (step_abs % log_every) == 0:
+            log_step(step_abs, t_ps, v, F)
+            log_wall_force(step_abs, t_ps, F)
+
+        maybe_write_traj(step_abs)
+
+        if restart_every > 0 and (step_abs % restart_every == 0):
+            atoms.set_velocities(v)
+            write(restart_path.as_posix(), atoms, format="extxyz")
+
+        if istep >= n_warm_steps:
+            prod_step = istep - n_warm_steps
+            if (prod_step % profile_every) == 0:
+                posS = atoms.get_positions()[solv_atom_slice].reshape(n_mols, nat, 3)
+                velS = v[solv_atom_slice].reshape(n_mols, nat, 3)
+
+                com = _com_from_block(posS, weights)
+                comv = _com_from_block(velS, weights)
+
+                zc = com[:, 2]
+                vx = comv[:, 0]
+
+                bins = np.floor((zc - z_min) / dz).astype(int)
+                ok = (bins >= 0) & (bins < profile_z_bins)
+                bins = bins[ok]
+                vx = vx[ok]
+
+                bi = current_block_index(prod_samples_done)
+
+                np.add.at(vx_sum_blk[bi], bins, vx)
+                np.add.at(vx_n_blk[bi], bins, 1.0)
+                np.add.at(mol_n_blk[bi], bins, 1.0)
+                np.add.at(mol_m_blk[bi], bins, mol_mass_g)
+
+                prod_samples_done += 1
+
+                if (prod_samples_done % 100) == 0:
+                    np.savez(
+                        accum_npz,
+                        vx_sum_blk=vx_sum_blk,
+                        vx_n_blk=vx_n_blk,
+                        mol_n_blk=mol_n_blk,
+                        mol_m_blk=mol_m_blk,
+                        prod_samples_done=prod_samples_done,
+                    )
+
+    atoms.set_velocities(v)
+    write(restart_path.as_posix(), atoms, format="extxyz")
+
+    np.savez(
+        accum_npz,
+        vx_sum_blk=vx_sum_blk,
+        vx_n_blk=vx_n_blk,
+        mol_n_blk=mol_n_blk,
+        mol_m_blk=mol_m_blk,
+        prod_samples_done=prod_samples_done,
+    )
+
+    vol_bin_A3 = Axy * dz
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        vx_mean_blk = np.where(vx_n_blk > 0, vx_sum_blk / vx_n_blk, np.nan)
+
+    vx_sum_all = np.nansum(vx_sum_blk, axis=0)
+    vx_n_all = np.nansum(vx_n_blk, axis=0)
+    vx_mean = np.where(vx_n_all > 0, vx_sum_all / vx_n_all, np.nan)
+
+    vx_sem = np.full(profile_z_bins, np.nan, dtype=float)
+    for k in range(profile_z_bins):
+        vals = vx_mean_blk[:, k]
+        okb = np.isfinite(vals)
+        if okb.sum() >= 3:
+            vx_sem[k] = float(np.nanstd(vals[okb], ddof=1) / np.sqrt(okb.sum()))
+
+    mol_n_all = np.nansum(mol_n_blk, axis=0)
+    mol_m_all = np.nansum(mol_m_blk, axis=0)
+    Nsamp = float(max(1, prod_samples_done))
+    n_density_per_A3 = mol_n_all / (Nsamp * vol_bin_A3)
+    rho_g_cm3 = (mol_m_all / Nsamp) / (vol_bin_A3 * 1e-24)
+
+    prof_csv = out_dir / "vx_profile_z.csv"
+    with open(prof_csv, "w") as fh:
+        fh.write("z_A,mean_vx_A_per_fs,sem_vx_A_per_fs,number_density_per_A3,mass_density_g_cm3,count\n")
+        for zc, vv, se, nd, rg, nn in zip(bin_centers, vx_mean, vx_sem, n_density_per_A3, rho_g_cm3, vx_n_all):
+            vv_s = "" if np.isnan(vv) else f"{vv:.8e}"
+            se_s = "" if np.isnan(se) else f"{se:.8e}"
+            fh.write(f"{zc:.6f},{vv_s},{se_s},{nd:.8e},{rg:.6f},{int(nn)}\n")
+
+    meta = {
+        "tag": tag_name,
+        "mode": "nemd_poiseuille",
+        "solvent": solvent_name,
+        "device": device,
+        "model": model_key,
+        "temp_K": float(temp_K),
+        "dt_fs": float(dt_fs),
+        "warmup_ps": float(warmup_ps),
+        "prod_ps": float(prod_ps),
+        "friction_ps_inv": float(friction_ps_inv),
+        "body_accel_mps2": float(body_accel_mps2),
+        "body_accel_A_fs2": float(a_Afs2),
+        "freeze_graphene": bool(freeze_graphene),
+        "graphene_z_bot_A": float(z_bot),
+        "graphene_z_top_A": float(z_top),
+        "gap_A": float(gap),
+        "area_A2": float(Axy),
+        "profile": {
+            "z_bins": int(profile_z_bins),
+            "profile_every_steps": int(profile_every),
+            "n_profile_blocks": int(n_profile_blocks),
+            "z_exclude_A_recommended": float(z_exclude_A),
+        },
+        "files": {
+            "vx_profile_z_csv": str(prof_csv),
+            "wall_force_csv": str(wall_csv),
+            "steps_csv": str(steps_csv),
+            "accum_npz": str(accum_npz),
+            "restart": str(restart_path),
+            "traj_extxyz": str(traj_path) if traj_path.exists() else None,
+        },
+        "notes": [
+            "Viscosity/slip are extracted by fitting v_x(z) in the continuum-like region (exclude near-wall layers).",
+            "Transverse (y,z) Langevin thermostat avoids biasing the streaming direction.",
+            "For linear-response defensibility, repeat with 2–3 smaller accelerations and verify eta,b invariance.",
+        ],
+    }
+    summary_js.write_text(json.dumps(meta, indent=2))
+
+    t1 = time.perf_counter()
+    print(f"[NEMD DONE] {tag_name}: wrote {out_dir} | wall {t1 - t0:.1f}s | samples={prod_samples_done}")
+
+
 def run_md(out_dir: Path, atoms: Atoms, device: str, model_key: str, compile_flag: bool,
            temp_K: float, dt_fs: float, add_time_ps: float,
            friction_ps_inv: float, traj_every: int, restart_every: int,
@@ -915,6 +1345,28 @@ def main():
     ap.add_argument("--no-freeze-graphene", action="store_true",
                     help="Allow graphene sheets to move during MD (default freezes tag==1 atoms).")
 
+    # NEMD controls
+    ap.add_argument("--nemd", action="store_true",
+                    help="Run NEMD Poiseuille (body-force) instead of equilibrium Langevin MD.")
+    ap.add_argument("--nemd-warmup-ps", type=float, default=20.0,
+                    help="Warmup time (ps) before sampling profiles.")
+    ap.add_argument("--nemd-prod-ps", type=float, default=50.0,
+                    help="Production time (ps) for profile accumulation.")
+    ap.add_argument("--body-accel-mps2", type=float, default=1e12,
+                    help="Body acceleration (m/s^2) applied to solvent along +x.")
+    ap.add_argument("--profile-every", type=int, default=20,
+                    help="Accumulate v_x(z) every N steps during production.")
+    ap.add_argument("--profile-z-bins", type=int, default=200,
+                    help="Number of z bins for v_x(z) and density(z).")
+    ap.add_argument("--profile-blocks", type=int, default=10,
+                    help="Number of time blocks for SEM via block averaging.")
+    ap.add_argument("--z-exclude-A", type=float, default=3.0,
+                    help="Recommended near-wall exclusion for continuum fits (Å).")
+    ap.add_argument("--nemd-replicates", type=int, default=1,
+                    help="Number of NEMD replicates to run (separate output directories).")
+    ap.add_argument("--nemd-replicate-start", type=int, default=1,
+                    help="Starting replicate index for NEMD directory naming.")
+
     # Charge/spin
     ap.add_argument("--charge", type=float, default=None)
     ap.add_argument("--spin",   type=float, default=None)
@@ -995,20 +1447,74 @@ def main():
         atoms0.pbc = (True, True, True)
 
         try:
-            run_md(
-                out_dir=solv_dir, atoms=atoms0, device=args.device, model_key=args.model,
-                compile_flag=not args.no_compile, temp_K=args.temp_K, dt_fs=args.dt_fs,
-                add_time_ps=args.time_ps, friction_ps_inv=args.friction_ps_inv,
-                traj_every=args.traj_interval, restart_every=args.restart_every,
-                charge=args.charge, spin_mult=args.spin, infer_tag=tag,
-                no_progress=args.no_progress, progress_every=max(1, min(args.traj_interval, 100)),
-                resumed=resumed, tag_name=tag,
-                freeze_graphene=freeze_graphene
-            )
+            manifest_p = solv_dir / "solvate_manifest.json"
+            solvent_name = parse_tag(tag)["solvent"]
+            solvent_source = None
+            if manifest_p.is_file():
+                try:
+                    man = json.loads(manifest_p.read_text())
+                    solvent_name = man.get("solvent", solvent_name)
+                    solvent_source = man.get("solvent_source", None)
+                except Exception:
+                    pass
+
+            if args.nemd:
+                ax = args.body_accel_mps2
+                for rep in range(args.nemd_replicates):
+                    rep_idx = args.nemd_replicate_start + rep
+                    nemd_dir = solv_dir / f"nemd_poiseuille_ax{ax:.2e}_rep{rep_idx:02d}"
+                    restart_path = solv_dir / "restart_last.extxyz"
+                    if (not args.fresh_start) and restart_path.is_file():
+                        start_path = restart_path
+                        resumed = True
+                    else:
+                        start_path = start_solvated
+                        resumed = False
+
+                    atoms0 = read(start_path.as_posix())
+                    atoms0.set_cell(solvated_atoms.cell, scale_atoms=False)
+                    atoms0.pbc = (True, True, True)
+
+                    run_nemd_poiseuille(
+                        out_dir=nemd_dir,
+                        atoms=atoms0,
+                        tag_name=tag,
+                        solvent_name=solvent_name,
+                        solvent_source=solvent_source,
+                        solvent_lib=args.solvent_lib,
+                        device=args.device,
+                        model_key=args.model,
+                        compile_flag=not args.no_compile,
+                        temp_K=args.temp_K,
+                        dt_fs=args.dt_fs,
+                        warmup_ps=args.nemd_warmup_ps,
+                        prod_ps=args.nemd_prod_ps,
+                        friction_ps_inv=args.friction_ps_inv,
+                        body_accel_mps2=args.body_accel_mps2,
+                        profile_every=args.profile_every,
+                        profile_z_bins=args.profile_z_bins,
+                        n_profile_blocks=args.profile_blocks,
+                        z_exclude_A=args.z_exclude_A,
+                        traj_every=args.traj_interval,
+                        restart_every=args.restart_every,
+                        resumed=resumed,
+                        freeze_graphene=freeze_graphene,
+                        seed=args.seed + rep,
+                    )
+            else:
+                run_md(
+                    out_dir=solv_dir, atoms=atoms0, device=args.device, model_key=args.model,
+                    compile_flag=not args.no_compile, temp_K=args.temp_K, dt_fs=args.dt_fs,
+                    add_time_ps=args.time_ps, friction_ps_inv=args.friction_ps_inv,
+                    traj_every=args.traj_interval, restart_every=args.restart_every,
+                    charge=args.charge, spin_mult=args.spin, infer_tag=tag,
+                    no_progress=args.no_progress, progress_every=max(1, min(args.traj_interval, 100)),
+                    resumed=resumed, tag_name=tag,
+                    freeze_graphene=freeze_graphene
+                )
         except Exception as e:
             print(f"[MD ERROR] {tag}: {e}")
 
 
 if __name__ == "__main__":
     main()
-
