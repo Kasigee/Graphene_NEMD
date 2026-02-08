@@ -1362,6 +1362,10 @@ def main():
                     help="Number of time blocks for SEM via block averaging.")
     ap.add_argument("--z-exclude-A", type=float, default=3.0,
                     help="Recommended near-wall exclusion for continuum fits (Å).")
+    ap.add_argument("--nemd-replicates", type=int, default=1,
+                    help="Number of NEMD replicates to run (separate output directories).")
+    ap.add_argument("--nemd-replicate-start", type=int, default=1,
+                    help="Starting replicate index for NEMD directory naming.")
 
     # Charge/spin
     ap.add_argument("--charge", type=float, default=None)
@@ -1456,45 +1460,47 @@ def main():
 
             if args.nemd:
                 ax = args.body_accel_mps2
-                nemd_dir = solv_dir / f"nemd_poiseuille_ax{ax:.2e}"
-                restart_path = solv_dir / "restart_last.extxyz"
-                if (not args.fresh_start) and restart_path.is_file():
-                    start_path = restart_path
-                    resumed = True
-                else:
-                    start_path = start_solvated
-                    resumed = False
+                for rep in range(args.nemd_replicates):
+                    rep_idx = args.nemd_replicate_start + rep
+                    nemd_dir = solv_dir / f"nemd_poiseuille_ax{ax:.2e}_rep{rep_idx:02d}"
+                    restart_path = solv_dir / "restart_last.extxyz"
+                    if (not args.fresh_start) and restart_path.is_file():
+                        start_path = restart_path
+                        resumed = True
+                    else:
+                        start_path = start_solvated
+                        resumed = False
 
-                atoms0 = read(start_path.as_posix())
-                atoms0.set_cell(solvated_atoms.cell, scale_atoms=False)
-                atoms0.pbc = (True, True, True)
+                    atoms0 = read(start_path.as_posix())
+                    atoms0.set_cell(solvated_atoms.cell, scale_atoms=False)
+                    atoms0.pbc = (True, True, True)
 
-                run_nemd_poiseuille(
-                    out_dir=nemd_dir,
-                    atoms=atoms0,
-                    tag_name=tag,
-                    solvent_name=solvent_name,
-                    solvent_source=solvent_source,
-                    solvent_lib=args.solvent_lib,
-                    device=args.device,
-                    model_key=args.model,
-                    compile_flag=not args.no_compile,
-                    temp_K=args.temp_K,
-                    dt_fs=args.dt_fs,
-                    warmup_ps=args.nemd_warmup_ps,
-                    prod_ps=args.nemd_prod_ps,
-                    friction_ps_inv=args.friction_ps_inv,
-                    body_accel_mps2=args.body_accel_mps2,
-                    profile_every=args.profile_every,
-                    profile_z_bins=args.profile_z_bins,
-                    n_profile_blocks=args.profile_blocks,
-                    z_exclude_A=args.z_exclude_A,
-                    traj_every=args.traj_interval,
-                    restart_every=args.restart_every,
-                    resumed=resumed,
-                    freeze_graphene=freeze_graphene,
-                    seed=args.seed,
-                )
+                    run_nemd_poiseuille(
+                        out_dir=nemd_dir,
+                        atoms=atoms0,
+                        tag_name=tag,
+                        solvent_name=solvent_name,
+                        solvent_source=solvent_source,
+                        solvent_lib=args.solvent_lib,
+                        device=args.device,
+                        model_key=args.model,
+                        compile_flag=not args.no_compile,
+                        temp_K=args.temp_K,
+                        dt_fs=args.dt_fs,
+                        warmup_ps=args.nemd_warmup_ps,
+                        prod_ps=args.nemd_prod_ps,
+                        friction_ps_inv=args.friction_ps_inv,
+                        body_accel_mps2=args.body_accel_mps2,
+                        profile_every=args.profile_every,
+                        profile_z_bins=args.profile_z_bins,
+                        n_profile_blocks=args.profile_blocks,
+                        z_exclude_A=args.z_exclude_A,
+                        traj_every=args.traj_interval,
+                        restart_every=args.restart_every,
+                        resumed=resumed,
+                        freeze_graphene=freeze_graphene,
+                        seed=args.seed + rep,
+                    )
             else:
                 run_md(
                     out_dir=solv_dir, atoms=atoms0, device=args.device, model_key=args.model,
