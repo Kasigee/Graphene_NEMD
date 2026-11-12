@@ -1305,7 +1305,8 @@ def main():
 
     # Either provide --tags explicitly OR build a sweep (graphene mode)
     ap.add_argument("--tags", nargs="*", help="Optional subset of tags to run")
-    ap.add_argument("--solvent-lib", type=Path, default=Path("/home/kgrego23/solvents"))
+    ap.add_argument("--solvent-lib", type=Path, default=Path.home() / "solvents",
+                    help="Folder of solvent structure files named <solvent>.<ext> (default: ~/solvents)")
 
     # Graphene sweep builder
     ap.add_argument("--build-graphene-sweep", action="store_true",
